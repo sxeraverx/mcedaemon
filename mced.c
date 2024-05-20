@@ -629,30 +629,16 @@ kmce_to_mce(struct kernel_mce *kmce, struct mce *mce)
 /* this is used in a few places to throttle messages */
 struct rate_limit {
 	int initialized;		/* first one been done? */
-	int period;			/* milliseconds */
+	struct timeval period;
 	struct timeval last_time;	/* last time we hit this */
 };
-#define RATE_LIMIT(ms) { \
-	.initialized = 0, \
-	.period = ms, \
-	.last_time = { 0, 0} \
-}
-
-/* subtract two timevals */
-static int
-elapsed_usecs(struct timeval *t0, struct timeval *t1)
-{
-	int elapsed = (t1->tv_sec - t0->tv_sec) * 1000000;
-	elapsed += (t1->tv_usec - t0->tv_usec);
-	return elapsed;
-}
 
 /* do we need to apply rate limiting? */
 static int
 apply_rate_limit(struct rate_limit *limit)
 {
 	struct timeval now;
-	int msecs_since_last;
+	struct timeval since_last;
 
 	if (!limit->initialized) {
 		/* first time through here, just remember it */
@@ -663,10 +649,10 @@ apply_rate_limit(struct rate_limit *limit)
 
 	/* find how long it has been since the last event */
 	gettimeofday(&now, NULL);
-	msecs_since_last = elapsed_usecs(&limit->last_time, &now) / 1000;
+	timersub(&now, &limit->last_time, &since_last);
 
 	/* has enough time elapsed? */
-	if (msecs_since_last < limit->period) {
+	if (timercmp(&since_last, &limit->period, <)) {
 		/* rate limit */
 		return 1;
 	}
@@ -687,7 +673,7 @@ do_one_mce(struct kernel_mce *kmce)
 	/* initialize the rate limits based on a commandline flag */
 	if (!rate_limit_initialized) {
 		rate_limit_initialized = 1;
-		hw_overflow_limit.period = overflow_suppress_time * 1000;
+		hw_overflow_limit.period.tv_sec = overflow_suppress_time;
 	}
 
 	/* convert the kernel's MCE struct to our own */
@@ -744,13 +730,28 @@ get_loglen(int mce_fd)
 	}
 }
 
-/* add some usecs to a timeval */
-static void
-advance_time_usecs(struct timeval *tv, int adv_usecs)
+/* Convert seconds to microseconds. */
+static long int
+SEC_TO_USEC(long int sec)
 {
-	uint64_t tv_us = (tv->tv_sec * 1000000) + tv->tv_usec + adv_usecs;
-	tv->tv_sec = tv_us / 1000000;
-	tv->tv_usec = tv_us % 1000000;
+	return sec * 1000000;
+}
+
+/* Convert timeval to microseconds. */
+static long int
+TIMEVAL_TO_USEC(struct timeval *tv)
+{
+  return SEC_TO_USEC(tv->tv_sec) + tv->tv_usec;
+}
+
+
+/* Divide a timeval by an integer. The quotient is normalized. */
+static void
+timerdiv(const struct timeval *tv, int divisor, struct timeval *quotient) {
+	/* Avoid relying on tv->tv_sec after setting quotient->tv_sec in cases they alias. */
+	long int remainder_sec = tv->tv_sec % divisor;
+	quotient->tv_sec = tv->tv_sec / divisor;
+	quotient->tv_usec = (SEC_TO_USEC(remainder_sec) + tv->tv_usec) / divisor;
 }
 
 /* enforce MCE rate limiting */
@@ -759,7 +760,7 @@ rate_limit_mces(void)
 {
 	static int first_event = 1;
 	static struct timeval last_timestamp;
-	static int bias;
+	static struct timeval bias;
 
 	if (mce_rate_limit <= 0) {
 		/* no rate limiting */
@@ -771,20 +772,23 @@ rate_limit_mces(void)
 	} else {
 		/* we might have to rate limit */
 		struct timeval now;
-		int usecs_since_last;
-		int usecs_per_event = 1000000 / mce_rate_limit;
+		struct timeval since_last;
+		static const struct timeval one_second = {1, 0};
+		struct timeval time_per_event;
+		timerdiv(&one_second, mce_rate_limit, &time_per_event);
 
 		/* find how long it has been since the last event */
 		gettimeofday(&now, NULL);
-		usecs_since_last = elapsed_usecs(&last_timestamp, &now);
+		timersub(&now, &last_timestamp, &since_last);
 
 		/* set the last_timestamp to now, we might change it later */
 		last_timestamp = now;
 
 		/* are we under the minimum time between events? */
-		if (usecs_per_event > usecs_since_last) {
-			int usecs_to_kill;
-			int missed_by;
+		if (timercmp(&time_per_event, &since_last, >)) {
+			struct timeval time_to_kill;
+			struct timeval missed_by;
+			struct timeval time_to_sleep;
 
 			/*
 			 * We set the last_timestamp to the *ideal* time
@@ -800,16 +804,18 @@ rate_limit_mces(void)
 			 * deltas somewhat slowly, so large transients
 			 * should not distort the bias too quickly.
 			 */
-			usecs_to_kill = usecs_per_event - usecs_since_last;
-			advance_time_usecs(&last_timestamp, usecs_to_kill);
-			if ((usecs_to_kill + bias) > 0) {
+			timersub(&time_per_event, &since_last, &time_to_kill);
+			timeradd(&last_timestamp, &time_to_kill, &last_timestamp);
+			timeradd(&time_to_kill, &bias, &time_to_sleep);
+			if (TIMEVAL_TO_USEC(&time_to_sleep) > 0) {
 				/* do the actual sleep */
-				usleep(usecs_to_kill + bias);
+				usleep(TIMEVAL_TO_USEC(&time_to_sleep));
 			}
 			/* adjust the bias */
 			gettimeofday(&now, NULL);
-			missed_by = elapsed_usecs(&last_timestamp, &now);
-			bias -= missed_by / 8;
+			timersub(&now, &last_timestamp, &missed_by);
+			timerdiv(&missed_by, 8, &missed_by);
+			timersub(&bias, &missed_by, &bias);
 		}
 	}
 }
@@ -827,7 +833,7 @@ do_pending_mces(int mce_fd)
 	/* initialize the rate limits based on a commandline flag */
 	if (!rate_limit_initialized) {
 		rate_limit_initialized = 1;
-		sw_overflow_limit.period = overflow_suppress_time * 1000;
+		sw_overflow_limit.period.tv_sec = overflow_suppress_time;
 	}
 
 	/* check for MCEs */
@@ -1079,7 +1085,7 @@ open_mcelog(const char *path)
 		if (!printed_msg) {
 			printed_msg = 1;
 			mced_log(LOG_ERR, "ERR: can't stat %s: %s\n",
-			            path, strerror(errno));
+			         path, strerror(errno));
 		}
 		return -1;
 	}
